@@ -75,6 +75,16 @@ module GEOS_IrradGridCompMod
 
    use irradmod, only: IRRAD
 
+#ifdef RUN_RRTMGP_GT4PY
+   ! GT4Py/NDSL (PySHiELD) radiation CFFI bridge (OFF by default; built only when
+   ! BUILD_GEOS_RADIATION_GT4PY_INTERFACE=ON and dormant unless RUN_RRTMGP_GT4PY:=1).
+   ! Mirrors FV_StateMod.F90's guarded `use geos_gtfv3_interface_mod` + ieee_exceptions.
+   use ieee_exceptions, only: ieee_get_halting_mode, ieee_set_halting_mode, ieee_all
+   use geos_rrtmgp_interface_mod, only: geos_rrtmgp_interface_f_init, &
+        geos_rrtmgp_interface_f, geos_rrtmgp_interface_f_finalize
+   use iso_c_binding, only: c_int, c_double
+#endif
+
    implicit none
    private
 
@@ -157,6 +167,14 @@ module GEOS_IrradGridCompMod
    type ty_RRTMGP_wrap
       type (ty_RRTMGP_state), pointer :: ptr => null()
    end type ty_RRTMGP_wrap
+
+#ifdef RUN_RRTMGP_GT4PY
+   ! Runtime switch for the GT4Py bridge, read from the MAPL resource
+   ! RUN_RRTMGP_GT4PY: (default 0 = native/pyRTE path). SAVEd module scalar so the
+   ! LW driver can see it and so init happens exactly once across radiation refreshes.
+   integer, save :: run_rrtmgp_gt4py = 0
+   logical, save :: gt4py_bridge_initialized = .false.
+#endif
 
 contains
 
@@ -682,6 +700,13 @@ contains
 
       call MAPL_GetResource(MAPL,CalledLast,'CALLED_LAST:', default=1, _RC)
 
+#ifdef RUN_RRTMGP_GT4PY
+      ! Runtime guard for the GT4Py/NDSL bridge. Default 0 => native/pyRTE path even
+      ! when the bridge .so was built. Mirrors FV_StateMod.F90's
+      ! MAPL_GetResource(..., run_gtfv3, 'RUN_GTFV3:', default=0).
+      call MAPL_GetResource(MAPL, run_rrtmgp_gt4py, 'RUN_RRTMGP_GT4PY:', default=0, _RC)
+#endif
+
       ! Fill exported fluxed based on latest Ts
 
       if (CalledLast/=0) then
@@ -928,6 +953,31 @@ contains
          logical ::   calc_clrnoa,   calc_clrsky,   calc_allnoa,   calc_allsky
          logical :: allnoa_to_allsky_band_xfer_needed
          integer :: ncol, nbnd, ngpt, nmom, nga, icergh
+
+#ifdef RUN_RRTMGP_GT4PY
+         ! --- GT4Py/NDSL (PySHiELD) bridge locals (whole-tile, R8) --------------
+         ! Whole-tile input buffers the bridge marshals in. Allocated (ncol,LM) /
+         ! (ncol,LM+1) / (ncol) to match the bridge's F-order (ncol-fastest) contract,
+         ! which is exactly GEOS column-major (ncol,LM). Everything is c_double (R8).
+         real(c_double), allocatable :: gt4py_q(:,:), gt4py_o3(:,:), gt4py_co2(:,:)
+         real(c_double), allocatable :: gt4py_ql(:,:), gt4py_qi(:,:), gt4py_qcld(:,:)
+         real(c_double), allocatable :: gt4py_islmsk(:)
+         ! Whole-tile output buffers (bridge computes BOTH LW and SW each call; IRRAD
+         ! keeps only the LW ones and discards the SW/heating buffers -- see Phase-3
+         ! note about collapsing SOLAR+IRRAD into a single shared bridge call).
+         real(c_double), allocatable :: gt4py_fswu(:,:), gt4py_fswd(:,:)
+         real(c_double), allocatable :: gt4py_fswu_clr(:,:), gt4py_fswd_clr(:,:)
+         real(c_double), allocatable :: gt4py_fswn(:)
+         real(c_double), allocatable :: gt4py_hrtlw(:,:), gt4py_hrtsw(:,:)
+         real(c_double), allocatable :: gt4py_hrtlw_clr(:,:), gt4py_hrtsw_clr(:,:)
+         integer                     :: gt4py_comm, gt4py_t1
+         real(c_double)              :: gt4py_dt
+         logical                     :: gt4py_halting(5)
+         type(ESMF_VM)               :: gt4py_vm
+         type(ESMF_Time)             :: gt4py_time
+         integer                     :: gt4py_yy, gt4py_mm, gt4py_dd
+         integer                     :: gt4py_hh, gt4py_mn, gt4py_sc
+#endif
          integer :: b, nBlocks, colS, colE, ncols_block, &
               partial_blockSize, icol, isub, ilay, igpt
          character(len=ESMF_MAXPATHLEN) :: k_dist_file, cloud_optics_file
@@ -1783,6 +1833,104 @@ contains
             ! Total number of blocks including any final partial block
             nBlocks = (ncol + rrtmgp_blockSize - 1) / rrtmgp_blockSize
 
+#ifdef RUN_RRTMGP_GT4PY
+            if (run_rrtmgp_gt4py /= 0) then
+               ! ============================================================
+               ! GT4Py/NDSL (PySHiELD) WHOLE-TILE radiation bridge (LW path).
+               !
+               ! Residency rule: hand the ENTIRE column tile (ncol = IM*JM) to the
+               ! bridge in ONE call -- NOT the ncols_block OMP loop below -- so there
+               ! is one H2D in / one D2H out per radiation refresh instead of ~ncol/4
+               ! tiny launches. The bridge fills the SAME whole-tile flux_* arrays the
+               ! OMP loop would, so the POST reshape/writeback below is unchanged.
+               !
+               ! TODO (Phase 3), flagged for the GEOS build team:
+               !  * Field unit/form mapping is a FIRST DRAFT: qvapor is passed as GEOS
+               !    specific humidity (QV, kg/kg) and qo3mr as GEOS O3 mass mixing
+               !    ratio -- confirm against pyshield marshal.RAD_INPUT_FIELDS (the
+               !    pyRTE path here converts to vmr; the bridge is expected to convert
+               !    internally, so the raw GEOS fields are passed). qcld is passed as
+               !    cloud fraction FCLD. islmsk is passed as zeros (unused under the
+               !    default ialbflg=-1/iemsflg=0 flags) -- wire a real land mask if a
+               !    flag that reads it is enabled.
+               !  * dfupdts_allsky (Ts Jacobian) is NOT returned by the simple-path
+               !    bridge; DFDTS is left at its incoming value here. Wire the Jacobian
+               !    output when the bridge grows it.
+               !  * The bridge computes BOTH LW and SW. Calling it here (LW) and again
+               !    from SOLAR (SW) double-computes. The intended final design is ONE
+               !    shared bridge call feeding both grid comps.
+               ! ============================================================
+
+               ! One-time bridge init (build driver/factories/device state once),
+               ! FPE-trap-wrapped exactly like FV_StateMod.F90:1206-1212 because
+               ! importing numpy/the driver can raise SIGFPE under GEOS trapping.
+               call ESMF_VMGetCurrent(gt4py_vm, _RC)
+               call ESMF_VMGet(gt4py_vm, mpiCommunicator=gt4py_comm, _RC)
+               call ESMF_ClockGet(CLOCK, currTime=gt4py_time, _RC)
+               call ESMF_TimeGet(gt4py_time, yy=gt4py_yy, mm=gt4py_mm, dd=gt4py_dd, &
+                    h=gt4py_hh, m=gt4py_mn, s=gt4py_sc, _RC)
+               call MAPL_GetResource(MAPL, gt4py_dt, 'RUN_DT:', _RC)
+               gt4py_t1 = merge(1, 0, top_at_1)   ! GEOS is top-down => 1
+
+               if (.not. gt4py_bridge_initialized) then
+                  call ieee_get_halting_mode(ieee_all, gt4py_halting)
+                  call ieee_set_halting_mode(ieee_all, .false.)
+                  ! nx=IM, ny=JM, nz=LM, nhalo=0; the bridge requires nx*ny == ncol.
+                  call geos_rrtmgp_interface_f_init( &
+                       gt4py_comm, IM, JM, LM, 0, gt4py_t1, &
+                       gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, &
+                       gt4py_dt)
+                  call ieee_set_halting_mode(ieee_all, gt4py_halting)
+                  gt4py_bridge_initialized = .true.
+               end if
+
+               ! Assemble whole-tile R8 inputs. ncol = IM*JM; GEOS imports are 3D
+               ! (IM,JM,LM) column-major, so reshape to (ncol,LM) is a layout-preserving
+               ! fold (ncol fastest) matching the bridge's F-order contract.
+               allocate(gt4py_q(ncol,LM), gt4py_o3(ncol,LM), gt4py_co2(ncol,LM), _STAT)
+               allocate(gt4py_ql(ncol,LM), gt4py_qi(ncol,LM), gt4py_qcld(ncol,LM), _STAT)
+               allocate(gt4py_islmsk(ncol), _STAT)
+               gt4py_q    = real(reshape(Q,  (/ncol,LM/)), kind=c_double)
+               gt4py_o3   = real(reshape(O3, (/ncol,LM/)), kind=c_double)
+               if (associated(CO2_3d)) then
+                  gt4py_co2 = real(reshape(CO2_3d, (/ncol,LM/)), kind=c_double)
+               else
+                  gt4py_co2 = real(CO2_FIXED, kind=c_double)
+               end if
+               gt4py_ql   = real(reshape(QL,   (/ncol,LM/)), kind=c_double)
+               gt4py_qi   = real(reshape(QI,   (/ncol,LM/)), kind=c_double)
+               gt4py_qcld = real(reshape(FCLD, (/ncol,LM/)), kind=c_double)
+               gt4py_islmsk = 0._c_double
+
+               ! Discard buffers for the SW/heating outputs IRRAD does not consume.
+               allocate(gt4py_fswu(ncol,LM+1), gt4py_fswd(ncol,LM+1), _STAT)
+               allocate(gt4py_fswu_clr(ncol,LM+1), gt4py_fswd_clr(ncol,LM+1), _STAT)
+               allocate(gt4py_fswn(ncol), _STAT)
+               allocate(gt4py_hrtlw(ncol,LM), gt4py_hrtsw(ncol,LM), _STAT)
+               allocate(gt4py_hrtlw_clr(ncol,LM), gt4py_hrtsw_clr(ncol,LM), _STAT)
+
+               ! One whole-tile run. The LW flux outputs are written straight into the
+               ! same flux_up_allsky/flux_dn_allsky (and clrsky) arrays the OMP loop
+               ! fills, so the existing POST section needs no change.
+               call geos_rrtmgp_interface_f( &
+                    gt4py_comm, IM, JM, LM, gt4py_t1, &
+                    gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, &
+                    p_lev, p_lay, t_lay, t_sfc, &
+                    gt4py_q, gt4py_o3, gt4py_co2, &
+                    gt4py_ql, gt4py_qi, gt4py_qcld, &
+                    t_sfc, gt4py_islmsk, &
+                    flux_up_allsky, flux_dn_allsky, gt4py_fswu, gt4py_fswd, &
+                    flux_up_clrsky, flux_dn_clrsky, gt4py_fswu_clr, gt4py_fswd_clr, &
+                    gt4py_fswn, &
+                    gt4py_hrtlw, gt4py_hrtsw, gt4py_hrtlw_clr, gt4py_hrtsw_clr)
+
+               deallocate(gt4py_q, gt4py_o3, gt4py_co2, _STAT)
+               deallocate(gt4py_ql, gt4py_qi, gt4py_qcld, gt4py_islmsk, _STAT)
+               deallocate(gt4py_fswu, gt4py_fswd, gt4py_fswu_clr, gt4py_fswd_clr, _STAT)
+               deallocate(gt4py_fswn, _STAT)
+               deallocate(gt4py_hrtlw, gt4py_hrtsw, gt4py_hrtlw_clr, gt4py_hrtsw_clr, _STAT)
+            else
+#endif
             ! loop over all blocks
             loop_status = ESMF_SUCCESS
             !$OMP PARALLEL DO SCHEDULE(DYNAMIC) DEFAULT(SHARED) PRIVATE(STATUS)
@@ -1827,6 +1975,9 @@ contains
             end do ! loop over blocks
             !$OMP END PARALLEL DO
             VERIFY_(loop_status)
+#ifdef RUN_RRTMGP_GT4PY
+            end if  ! run_rrtmgp_gt4py /= 0
+#endif
 
             ! tidy up
             if (need_dirty_optical_props) nullify(TAUA_3d,SSAA_3d,ASYA_3d)
