@@ -41,6 +41,16 @@ if (BUILD_GEOS_RADIATION_GT4PY_INTERFACE)
   find_package(MPI REQUIRED)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
+  # The embedding .so MUST be built by the Python that has `pyshield` installed
+  # (the Fork-A venv). That is NOT the interpreter GEOS/MAPL discovers for its own
+  # use (GEOS/MAPL overrides Python3_EXECUTABLE with its baselibs/GEOSpyD Python,
+  # which has no `pyshield` -> "No module named 'pyshield'"). So use a dedicated
+  # variable, overridable at configure time, instead of ${Python3_EXECUTABLE}.
+  # Pass -DGEOS_RADIATION_PYSHIELD_PYTHON=/path/to/venv/bin/python.
+  set(GEOS_RADIATION_PYSHIELD_PYTHON "${Python3_EXECUTABLE}"
+      CACHE FILEPATH "Python interpreter that has pyshield installed (builds the embedding .so)")
+  message(STATUS "PySHiELD embedding-library Python: ${GEOS_RADIATION_PYSHIELD_PYTHON}")
+
   # Names mirror gtFV3's; the generator writes libgeos_rrtmgp_interface_py.so and
   # geos_rrtmgp_interface_py.h into CMAKE_CURRENT_BINARY_DIR (its CWD). The C shim
   # (geos_rrtmgp_interface.c) #includes that generated header, so the build dir is
@@ -53,7 +63,7 @@ if (BUILD_GEOS_RADIATION_GT4PY_INTERFACE)
   add_custom_command(
     OUTPUT ${GEOS_RRTMGP_INTERFACE_LIBRARY}
     COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 1
-            ${Python3_EXECUTABLE} -m pyshield.geos_bridge.cffi.geos_rrtmgp_interface
+            ${GEOS_RADIATION_PYSHIELD_PYTHON} -m pyshield.geos_bridge.cffi.geos_rrtmgp_interface
     BYPRODUCTS ${GEOS_RRTMGP_INTERFACE_HEADER_FILE}
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
     COMMENT "Building PySHiELD radiation CFFI interface library with Python"
