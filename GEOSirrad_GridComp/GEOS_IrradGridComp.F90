@@ -1982,6 +1982,21 @@ contains
             end if  ! run_rrtmgp_gt4py /= 0
 #endif
 
+            ! --- TEMP GT4PY LWCHK (remove after): all-sky LW flux summary on the root
+            ! PET, for a native-vs-bridge numeric comparison at the FIRST radiation step
+            ! (identical input state, radiation the only difference). flux_*_allsky are
+            ! (ncol,LM+1); top_at_1 => (:,1)=TOA, (:,LM+1)=surface. Compare the first
+            ! [GT4PY LWCHK] lines between a mode-0 (native) and mode-2 (bridge) run. ---
+            if (MAPL_AM_I_Root()) then
+               write(*,'(a,3(x,es18.11))') '[GT4PY LWCHK] mean toaUp(OLR) sfcUp sfcDn =', &
+                    sum(flux_up_allsky(:,1))   /size(flux_up_allsky,1), &
+                    sum(flux_up_allsky(:,LM+1))/size(flux_up_allsky,1), &
+                    sum(flux_dn_allsky(:,LM+1))/size(flux_dn_allsky,1)
+               write(*,'(a,4(x,es18.11))') '[GT4PY LWCHK] fup(min,max) fdn(min,max)  =', &
+                    minval(flux_up_allsky), maxval(flux_up_allsky), &
+                    minval(flux_dn_allsky), maxval(flux_dn_allsky)
+            end if
+
             ! tidy up
             if (need_dirty_optical_props) nullify(TAUA_3d,SSAA_3d,ASYA_3d)
             if (need_cloud_optical_props) nullify(CWC_3d,REFF_3d)
