@@ -5282,6 +5282,15 @@ contains
         allocate(gt4py_hrtlw(ncol,LM), gt4py_hrtsw(ncol,LM), __STAT__)
         allocate(gt4py_hrtlw_clr(ncol,LM), gt4py_hrtsw_clr(ncol,LM), __STAT__)
 
+        ! --- TEMP GT4PY DBG (remove after): what does the Fortran side actually hold
+        ! for the vertical arrays right before the bridge call? Shows whether p_lev is
+        ! full-91 (then a C-ABI issue) or already short (then a GEOS fill issue). ---
+        write(*,'(a,3(x,i0))') '[GT4PY DBG SW] ncol LM size(p_lev,2) =', ncol, LM, size(p_lev,2)
+        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lev(1,1:6)=', p_lev(1,1:min(6,size(p_lev,2)))
+        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lev(1,LM-3:LM+1)=', p_lev(1,max(1,LM-3):LM+1)
+        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lay(1,LM-3:LM)=', p_lay(1,max(1,LM-3):LM)
+        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] gt4py_q(1,LM-3:LM)=', gt4py_q(1,max(1,LM-3):LM)
+
         ! One whole-tile run. SW up fluxes land directly in flux_up_allsky/clrsky;
         ! net = down - up is formed afterward (the native path produces net directly).
         call geos_rrtmgp_interface_f( &
