@@ -5222,7 +5222,14 @@ contains
       nBlocks = (ncol + rrtmgp_blockSize - 1) / rrtmgp_blockSize
 
 #ifdef RUN_RRTMGP_GT4PY
-      if (run_rrtmgp_gt4py /= 0) then
+      ! RUN_RRTMGP_GT4PY mode: 0=off (native), 1=both LW+SW, 2=LW(IRRAD) only,
+      ! 3=SW(SOLAR) only. The SW path is a KNOWN-INCOMPLETE whole-tile call: SORAD
+      ! load-balances SUNLIT columns across ranks (daytime pack, variable Num2do),
+      ! so the arrays here are NOT this rank's full tile and do not match the
+      ! bridge's IM*JM init -> wrong column count -> corrupt read. Until the SW
+      ! call is reworked to run on the full (unpacked) tile, SW is left on the
+      ! native path for modes 0/2; only modes 1/3 take the (still-broken) SW bridge.
+      if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 3) then
         ! ============================================================
         ! GT4Py/NDSL (PySHiELD) WHOLE-TILE radiation bridge (SW path).
         ! Structural mirror of the IRRAD side (GEOS_IrradGridComp.F90): hand the
@@ -5281,15 +5288,6 @@ contains
         allocate(gt4py_flwu_clr(ncol,LM+1), gt4py_flwd_clr(ncol,LM+1), __STAT__)
         allocate(gt4py_hrtlw(ncol,LM), gt4py_hrtsw(ncol,LM), __STAT__)
         allocate(gt4py_hrtlw_clr(ncol,LM), gt4py_hrtsw_clr(ncol,LM), __STAT__)
-
-        ! --- TEMP GT4PY DBG (remove after): what does the Fortran side actually hold
-        ! for the vertical arrays right before the bridge call? Shows whether p_lev is
-        ! full-91 (then a C-ABI issue) or already short (then a GEOS fill issue). ---
-        write(*,'(a,3(x,i0))') '[GT4PY DBG SW] ncol LM size(p_lev,2) =', ncol, LM, size(p_lev,2)
-        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lev(1,1:6)=', p_lev(1,1:min(6,size(p_lev,2)))
-        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lev(1,LM-3:LM+1)=', p_lev(1,max(1,LM-3):LM+1)
-        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] p_lay(1,LM-3:LM)=', p_lay(1,max(1,LM-3):LM)
-        write(*,'(a,99(x,es10.3))') '[GT4PY DBG SW] gt4py_q(1,LM-3:LM)=', gt4py_q(1,max(1,LM-3):LM)
 
         ! One whole-tile run. SW up fluxes land directly in flux_up_allsky/clrsky;
         ! net = down - up is formed afterward (the native path produces net directly).

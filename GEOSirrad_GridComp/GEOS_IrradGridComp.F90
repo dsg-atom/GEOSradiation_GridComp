@@ -1834,7 +1834,10 @@ contains
             nBlocks = (ncol + rrtmgp_blockSize - 1) / rrtmgp_blockSize
 
 #ifdef RUN_RRTMGP_GT4PY
-            if (run_rrtmgp_gt4py /= 0) then
+            ! RUN_RRTMGP_GT4PY mode: 0=off, 1=both LW+SW, 2=LW(IRRAD) only,
+            ! 3=SW(SOLAR) only. LW runs on the FULL tile (all columns, no sunlit
+            ! packing), so this whole-tile bridge call matches the IM*JM init.
+            if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 2) then
                ! ============================================================
                ! GT4Py/NDSL (PySHiELD) WHOLE-TILE radiation bridge (LW path).
                !
