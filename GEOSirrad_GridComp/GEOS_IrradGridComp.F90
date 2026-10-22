@@ -1878,9 +1878,14 @@ contains
                if (.not. gt4py_bridge_initialized) then
                   call ieee_get_halting_mode(ieee_all, gt4py_halting)
                   call ieee_set_halting_mode(ieee_all, .false.)
-                  ! nx=IM, ny=JM, nz=LM, nhalo=0; the bridge requires nx*ny == ncol.
+                  ! nx=IM, ny=JM, nz=LM, nhalo=3. nhalo MUST be 3: PySHiELD's
+                  ! state.to_rterrtmgp_xr strips the SHiELD grid halo+stagger with a
+                  ! hardcoded [3:-4] (data domain = nx+2*nhalo+1), so only nhalo=3
+                  ! yields ncol == nx*ny (= IM*JM). With nhalo=0 it over-strips to
+                  ! (nx-6)*(ny-6) and the gas-optics ncol assert fails. The GEOS
+                  ! whole-tile IM*JM data lands in the (IM,JM) compute interior.
                   call geos_rrtmgp_interface_f_init( &
-                       gt4py_comm, IM, JM, LM, 0, gt4py_t1, &
+                       gt4py_comm, IM, JM, LM, 3, gt4py_t1, &
                        gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, &
                        gt4py_dt)
                   call ieee_set_halting_mode(ieee_all, gt4py_halting)

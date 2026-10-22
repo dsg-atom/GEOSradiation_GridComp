@@ -5262,8 +5262,10 @@ contains
         if (.not. gt4py_bridge_initialized) then
           call ieee_get_halting_mode(ieee_all, gt4py_halting)
           call ieee_set_halting_mode(ieee_all, .false.)
+          ! nhalo MUST be 3 (not 0): PySHiELD's to_rterrtmgp_xr strips the SHiELD
+          ! halo+stagger with a hardcoded [3:-4], so only nhalo=3 gives ncol==nx*ny.
           call geos_rrtmgp_interface_f_init( &
-               gt4py_comm, IM, JM, LM, 0, gt4py_t1, &
+               gt4py_comm, IM, JM, LM, 3, gt4py_t1, &
                gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, gt4py_dt)
           call ieee_set_halting_mode(ieee_all, gt4py_halting)
           gt4py_bridge_initialized = .true.
