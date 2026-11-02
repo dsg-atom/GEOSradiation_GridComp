@@ -962,6 +962,9 @@ contains
          real(c_double), allocatable :: gt4py_q(:,:), gt4py_o3(:,:), gt4py_co2(:,:)
          real(c_double), allocatable :: gt4py_ql(:,:), gt4py_qi(:,:), gt4py_qcld(:,:)
          real(c_double), allocatable :: gt4py_islmsk(:)
+         ! Real per-cell grid coords (radians), (ncol,), passed to the bridge init
+         ! so the Python solar-zenith uses the true grid (not placeholder zeros).
+         real(c_double), allocatable :: gt4py_lons(:), gt4py_lats(:)
          ! Whole-tile output buffers (bridge computes BOTH LW and SW each call; IRRAD
          ! keeps only the LW ones and discards the SW/heating buffers -- see Phase-3
          ! note about collapsing SOLAR+IRRAD into a single shared bridge call).
@@ -1884,10 +1887,18 @@ contains
                   ! yields ncol == nx*ny (= IM*JM). With nhalo=0 it over-strips to
                   ! (nx-6)*(ny-6) and the gas-optics ncol assert fails. The GEOS
                   ! whole-tile IM*JM data lands in the (IM,JM) compute interior.
+                  ! Real grid coords (radians), folded (ncol,) the same column-major
+                  ! way as the field inputs (reshape(.,(/ncol/))); the Python side
+                  ! places them (nx,ny) consistently with the marshalled columns.
+                  allocate(gt4py_lons(ncol), gt4py_lats(ncol), _STAT)
+                  gt4py_lons = real(reshape(LONS, (/ncol/)), kind=c_double)
+                  gt4py_lats = real(reshape(LATS, (/ncol/)), kind=c_double)
                   call geos_rrtmgp_interface_f_init( &
                        gt4py_comm, IM, JM, LM, 3, gt4py_t1, &
                        gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, &
-                       gt4py_dt)
+                       gt4py_dt, &
+                       gt4py_lons, gt4py_lats)
+                  deallocate(gt4py_lons, gt4py_lats, _STAT)
                   call ieee_set_halting_mode(ieee_all, gt4py_halting)
                   gt4py_bridge_initialized = .true.
                end if
