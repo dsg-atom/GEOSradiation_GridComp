@@ -3686,6 +3686,10 @@ contains
       ! fluxes that we actually need
       ! NB: fluxes_byand makes available fluxes%[bnd_]flux_[up|dn|net|dn_dir->"dir"].
       real(wp), dimension(:),       allocatable         :: flux_dn_top
+      ! Bridge-path SW normalization base = the bridge's OWN TOA incoming flux
+      ! (captured before the bridge buffers are freed). The bridge returns
+      ! physical W/m2, so the POST divide must use the bridge's incoming, not SLR.
+      real(wp), dimension(:),       allocatable         :: sw_norm_base
       real(wp), dimension(:,:),     allocatable, target :: flux_up_clrsky, flux_net_clrsky
       real(wp), dimension(:,:),     allocatable, target :: flux_up_allsky, flux_net_allsky
       real(wp), dimension(:,:,:),   allocatable, target :: bnd_flux_dn_allsky, bnd_flux_net_allsky, &
@@ -5319,6 +5323,21 @@ contains
         flux_net_allsky = gt4py_fswd     - flux_up_allsky
         flux_net_clrsky = gt4py_fswd_clr - flux_up_clrsky
 
+        ! Capture the bridge's TOA incoming (top_at_1 => k=1) as the SW
+        ! normalization base: the POST section divides the physical bridge fluxes
+        ! by this to get transmittances in Solar's normalized convention (the
+        ! bridge's absolute solar constant cancels; Solar's heartbeat rescale by
+        ! SLR reapplies the model insolation). Native path still uses SLR.
+        allocate(sw_norm_base(ncol), __STAT__)
+        sw_norm_base(:) = real(gt4py_fswd(:,1), kind=wp)
+
+        ! The bridge produces BROADBAND SW only; zero the per-band arrays it does
+        ! not fill so POST + the band-split surface fluxes (UV/PAR/NIR) get defined
+        ! zeros instead of garbage (per-band SW from the bridge is a later task).
+        bnd_flux_dn_allsky  = 0._wp
+        bnd_flux_net_allsky = 0._wp
+        bnd_flux_dir_allsky = 0._wp
+
         deallocate(gt4py_q, gt4py_o3, gt4py_co2, __STAT__)
         deallocate(gt4py_ql, gt4py_qi, gt4py_qcld, gt4py_tsfc, gt4py_islmsk, __STAT__)
         deallocate(gt4py_fswd, gt4py_fswd_clr, gt4py_fswn, __STAT__)
@@ -5397,7 +5416,21 @@ contains
 
       ! normalize by incoming solar radiation
       allocate(flux_dn_top(ncol), __STAT__)
-      flux_dn_top(:) = real(max(SLR1D, 1e-7), kind=wp)
+#ifdef RUN_RRTMGP_GT4PY
+      if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 3) then
+         ! Bridge SW path: normalize by the bridge's OWN TOA incoming (captured
+         ! before the bridge buffers were freed), not SLR. The bridge returns
+         ! physical W/m2, so this yields transmittances in Solar's normalized
+         ! convention (the absolute solar constant cancels; the heartbeat rescale
+         ! by SLR reapplies the model insolation).
+         flux_dn_top(:) = max(sw_norm_base(:), real(1e-7, kind=wp))
+         deallocate(sw_norm_base, __STAT__)
+      else
+#endif
+         flux_dn_top(:) = real(max(SLR1D, 1e-7), kind=wp)
+#ifdef RUN_RRTMGP_GT4PY
+      end if
+#endif
       do k = 1, LM+1
         flux_up_clrsky (:,k) = flux_up_clrsky (:,k) / flux_dn_top(:)
         flux_net_clrsky(:,k) = flux_net_clrsky(:,k) / flux_dn_top(:)
@@ -5414,6 +5447,22 @@ contains
         end do
       end do
       deallocate(flux_dn_top, __STAT__)
+
+      ! --- TEMP GT4PY SWCHK (remove after): normalized SW flux summary on the
+      ! root PET, for a native(mode 0) vs bridge(mode 3) numeric comparison at the
+      ! first radiation step (identical input state). Post-normalization => these
+      ! are transmittances (independent of the absolute insolation), so native and
+      ! bridge should match if the bridge SW + its normalization are right.
+      ! net = down - up; top_at_1 => (:,1)=TOA, (:,LM+1)=surface. ---
+      if (MAPL_AM_I_Root()) then
+         write(*,'(a,3(x,es18.11))') '[GT4PY SWCHK] mean netTOA netSfc upTOA =', &
+              sum(flux_net_allsky(:,1))   /size(flux_net_allsky,1), &
+              sum(flux_net_allsky(:,LM+1))/size(flux_net_allsky,1), &
+              sum(flux_up_allsky (:,1))   /size(flux_up_allsky,1)
+         write(*,'(a,4(x,es18.11))') '[GT4PY SWCHK] net(min,max) up(min,max) =', &
+              minval(flux_net_allsky), maxval(flux_net_allsky), &
+              minval(flux_up_allsky), maxval(flux_up_allsky)
+      end if
 
       ! load output arrays
       ! clear-sky fluxes
