@@ -3254,6 +3254,11 @@ contains
     ! Runtime guard for the GT4Py/NDSL bridge. Default 0 => native/pyRTE path even
     ! when the bridge .so was built. Mirrors FV_StateMod.F90's RUN_GTFV3: read.
     call MAPL_GetResource(MAPL, run_rrtmgp_gt4py, 'RUN_RRTMGP_GT4PY:', default=0, __RC__)
+    ! The SW GT4Py bridge runs the whole fixed (IM*JM) tile. SOLAR's load
+    ! balancer shuffles sunlit columns across PETs, which would break the
+    ! bridge's per-PET grid, so disable it for the bridge SW modes (1 and 3).
+    ! Native modes (0,2) are unaffected. Results are independent of balancing.
+    if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 3) LoadBalance = .FALSE.
 #endif
 
     call MAPL_TimerOff(MAPL,"PRELIMS",__RC__)
@@ -3754,6 +3759,16 @@ contains
       type(ESMF_VM)               :: gt4py_vm
       integer                     :: gt4py_yy, gt4py_mm, gt4py_dd
       integer                     :: gt4py_hh, gt4py_mn, gt4py_sc
+      ! Full-grid (whole-tile, IM*JM) bridge marshalling. SOLAR packs only
+      ! sunlit columns (ncol=NumLit) for its native SW, but the GT4Py bridge
+      ! runs the whole fixed tile; these hold the full-grid imports and the SW
+      ! outputs before the sunlit columns are gathered into the NumLit arrays.
+      real, pointer, dimension(:,:,:) :: fg_ple=>null(), fg_t=>null(), fg_qv=>null()
+      real, pointer, dimension(:,:,:) :: fg_o3=>null(), fg_ql=>null(), fg_qi=>null(), fg_cl=>null()
+      real, pointer, dimension(:,:)   :: fg_ts=>null()
+      real(wp),       allocatable     :: fg_plev(:,:), fg_play(:,:), fg_tlay(:,:)
+      real(c_double), allocatable     :: fg_fswu(:,:), fg_fswu_clr(:,:)
+      integer                         :: ncfg, kk
 #endif
       character(len=ESMF_MAXPATHLEN) :: k_dist_file, cloud_optics_file
       character(len=ESMF_MAXSTR)     :: error_msg
@@ -5286,58 +5301,94 @@ contains
           gt4py_bridge_initialized = .true.
         end if
 
-        ! Assemble whole-tile R8 inputs (reshape of the (NCOL,LM) working arrays).
-        allocate(gt4py_q(ncol,LM), gt4py_o3(ncol,LM), gt4py_co2(ncol,LM), __STAT__)
-        allocate(gt4py_ql(ncol,LM), gt4py_qi(ncol,LM), gt4py_qcld(ncol,LM), __STAT__)
-        allocate(gt4py_tsfc(ncol), gt4py_islmsk(ncol), __STAT__)
-        gt4py_q    = real(Q,  kind=c_double)
-        gt4py_o3   = real(O3, kind=c_double)
+        ! ---- Full-grid (whole-tile) bridge inputs --------------------------
+        ! SOLAR's native SW packs only sunlit columns (ncol=NumLit), but the
+        ! bridge runs the WHOLE fixed (IM*JM) tile. Marshal the full-grid
+        ! imports directly (reshape, as the Irrad/LW path does), run the bridge
+        ! on ALL columns -- night columns get mu0<0 => ~0 SW by design -- then
+        ! gather the sunlit columns back into the NumLit flux arrays so the
+        ! existing normalization + UnPackIt scatter is reused unchanged.
+        ! (LoadBalance is forced off for this mode, so ncol == NumLit and the
+        ! gather is a per-PET daytime mask.)
+        ncfg = IM*JM
+        call MAPL_GetPointer(IMPORT, fg_ple, 'PLE',  __RC__)
+        call MAPL_GetPointer(IMPORT, fg_t,   'T',    __RC__)
+        call MAPL_GetPointer(IMPORT, fg_qv,  'QV',   __RC__)
+        call MAPL_GetPointer(IMPORT, fg_o3,  'O3',   __RC__)
+        call MAPL_GetPointer(IMPORT, fg_ql,  'QL',   __RC__)
+        call MAPL_GetPointer(IMPORT, fg_qi,  'QI',   __RC__)
+        call MAPL_GetPointer(IMPORT, fg_cl,  'FCLD', __RC__)
+        call MAPL_GetPointer(IMPORT, fg_ts,  'TS',   __RC__)
+
+        allocate(fg_plev(ncfg,LM+1), fg_play(ncfg,LM), fg_tlay(ncfg,LM), __STAT__)
+        fg_plev = real(reshape(fg_ple, (/ncfg,LM+1/)), kind=wp)
+        fg_play = 0.5_wp*(fg_plev(:,1:LM) + fg_plev(:,2:LM+1))
+        fg_tlay = real(reshape(fg_t,   (/ncfg,LM/)),   kind=wp)
+
+        allocate(gt4py_q(ncfg,LM), gt4py_o3(ncfg,LM), gt4py_co2(ncfg,LM), __STAT__)
+        allocate(gt4py_ql(ncfg,LM), gt4py_qi(ncfg,LM), gt4py_qcld(ncfg,LM), __STAT__)
+        allocate(gt4py_tsfc(ncfg), gt4py_islmsk(ncfg), __STAT__)
+        gt4py_q    = real(reshape(fg_qv, (/ncfg,LM/)), kind=c_double)
+        gt4py_o3   = real(reshape(fg_o3, (/ncfg,LM/)), kind=c_double)
         gt4py_co2  = real(CO2, kind=c_double)
-        gt4py_ql   = real(QL, kind=c_double)
-        gt4py_qi   = real(QI, kind=c_double)
-        gt4py_qcld = real(CL, kind=c_double)
-        gt4py_tsfc = real(t_lay(:,LM), kind=c_double)
+        gt4py_ql   = real(reshape(fg_ql, (/ncfg,LM/)), kind=c_double)
+        gt4py_qi   = real(reshape(fg_qi, (/ncfg,LM/)), kind=c_double)
+        gt4py_qcld = real(reshape(fg_cl, (/ncfg,LM/)), kind=c_double)
+        gt4py_tsfc = real(reshape(fg_ts, (/ncfg/)),    kind=c_double)
         gt4py_islmsk = 0._c_double
 
-        allocate(gt4py_fswd(ncol,LM+1), gt4py_fswd_clr(ncol,LM+1), __STAT__)
-        allocate(gt4py_fswn(ncol), __STAT__)
-        allocate(gt4py_flwu(ncol,LM+1), gt4py_flwd(ncol,LM+1), __STAT__)
-        allocate(gt4py_flwu_clr(ncol,LM+1), gt4py_flwd_clr(ncol,LM+1), __STAT__)
-        allocate(gt4py_hrtlw(ncol,LM), gt4py_hrtsw(ncol,LM), __STAT__)
-        allocate(gt4py_hrtlw_clr(ncol,LM), gt4py_hrtsw_clr(ncol,LM), __STAT__)
+        allocate(gt4py_fswd(ncfg,LM+1), gt4py_fswd_clr(ncfg,LM+1), __STAT__)
+        allocate(fg_fswu(ncfg,LM+1), fg_fswu_clr(ncfg,LM+1), __STAT__)
+        allocate(gt4py_fswn(ncfg), __STAT__)
+        allocate(gt4py_flwu(ncfg,LM+1), gt4py_flwd(ncfg,LM+1), __STAT__)
+        allocate(gt4py_flwu_clr(ncfg,LM+1), gt4py_flwd_clr(ncfg,LM+1), __STAT__)
+        allocate(gt4py_hrtlw(ncfg,LM), gt4py_hrtsw(ncfg,LM), __STAT__)
+        allocate(gt4py_hrtlw_clr(ncfg,LM), gt4py_hrtsw_clr(ncfg,LM), __STAT__)
 
-        ! One whole-tile run. SW up fluxes land directly in flux_up_allsky/clrsky;
-        ! net = down - up is formed afterward (the native path produces net directly).
+        ! One whole-tile run (all IM*JM columns). The top-pressure KLUGE is done
+        ! on the PySHiELD side (gas optics clamps layer pressure into the k-dist
+        ! range); real full-grid pressures are already in range here. SW up lands
+        ! in fg_fswu/fg_fswu_clr, down in gt4py_fswd/gt4py_fswd_clr.
         call geos_rrtmgp_interface_f( &
              gt4py_comm, IM, JM, LM, gt4py_t1, &
              gt4py_yy, gt4py_mm, gt4py_dd, gt4py_hh, gt4py_mn, gt4py_sc, &
-             p_lev, p_lay, t_lay, gt4py_tsfc, &
+             fg_plev, fg_play, fg_tlay, gt4py_tsfc, &
              gt4py_q, gt4py_o3, gt4py_co2, &
              gt4py_ql, gt4py_qi, gt4py_qcld, &
              gt4py_tsfc, gt4py_islmsk, &
-             gt4py_flwu, gt4py_flwd, flux_up_allsky, gt4py_fswd, &
-             gt4py_flwu_clr, gt4py_flwd_clr, flux_up_clrsky, gt4py_fswd_clr, &
+             gt4py_flwu, gt4py_flwd, fg_fswu, gt4py_fswd, &
+             gt4py_flwu_clr, gt4py_flwd_clr, fg_fswu_clr, gt4py_fswd_clr, &
              gt4py_fswn, &
              gt4py_hrtlw, gt4py_hrtsw, gt4py_hrtlw_clr, gt4py_hrtsw_clr)
 
-        flux_net_allsky = gt4py_fswd     - flux_up_allsky
-        flux_net_clrsky = gt4py_fswd_clr - flux_up_clrsky
+        ! Gather the sunlit columns from the full-grid result into the NumLit
+        ! flux arrays (ncol==NumLit). pack() with the flattened daytime mask
+        ! reproduces PackIt's column order exactly, so the downstream
+        ! normalization + UnPackIt scatter is unchanged. top_at_1 => (:,1)=TOA;
+        ! net = down - up (the native path produces net directly).
+        do kk = 1, LM+1
+          flux_up_allsky (:,kk) = real(pack(fg_fswu(:,kk),        reshape(daytime,(/ncfg/))), kind=wp)
+          flux_up_clrsky (:,kk) = real(pack(fg_fswu_clr(:,kk),    reshape(daytime,(/ncfg/))), kind=wp)
+          flux_net_allsky(:,kk) = real(pack(gt4py_fswd(:,kk),     reshape(daytime,(/ncfg/))), kind=wp) &
+                                - flux_up_allsky(:,kk)
+          flux_net_clrsky(:,kk) = real(pack(gt4py_fswd_clr(:,kk), reshape(daytime,(/ncfg/))), kind=wp) &
+                                - flux_up_clrsky(:,kk)
+        end do
 
-        ! Capture the bridge's TOA incoming (top_at_1 => k=1) as the SW
-        ! normalization base: the POST section divides the physical bridge fluxes
-        ! by this to get transmittances in Solar's normalized convention (the
-        ! bridge's absolute solar constant cancels; Solar's heartbeat rescale by
-        ! SLR reapplies the model insolation). Native path still uses SLR.
+        ! Bridge TOA incoming (top_at_1 => k=1), sunlit columns, as the SW
+        ! normalization base: POST divides by it (the bridge's absolute solar
+        ! constant cancels; the SLR heartbeat reapplies the model insolation).
         allocate(sw_norm_base(ncol), __STAT__)
-        sw_norm_base(:) = real(gt4py_fswd(:,1), kind=wp)
+        sw_norm_base(:) = real(pack(gt4py_fswd(:,1), reshape(daytime,(/ncfg/))), kind=wp)
 
-        ! The bridge produces BROADBAND SW only; zero the per-band arrays it does
-        ! not fill so POST + the band-split surface fluxes (UV/PAR/NIR) get defined
-        ! zeros instead of garbage (per-band SW from the bridge is a later task).
+        ! The bridge produces BROADBAND SW only; zero the per-band arrays (NumLit)
+        ! so POST + the band-split surface fluxes (UV/PAR/NIR) get defined zeros
+        ! (per-band SW from the bridge is a later task).
         bnd_flux_dn_allsky  = 0._wp
         bnd_flux_net_allsky = 0._wp
         bnd_flux_dir_allsky = 0._wp
 
+        deallocate(fg_plev, fg_play, fg_tlay, fg_fswu, fg_fswu_clr, __STAT__)
         deallocate(gt4py_q, gt4py_o3, gt4py_co2, __STAT__)
         deallocate(gt4py_ql, gt4py_qi, gt4py_qcld, gt4py_tsfc, gt4py_islmsk, __STAT__)
         deallocate(gt4py_fswd, gt4py_fswd_clr, gt4py_fswn, __STAT__)
