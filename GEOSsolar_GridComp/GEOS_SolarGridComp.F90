@@ -5035,8 +5035,16 @@ contains
 
       ! RRTMGP's rte_sw takes a vertical ordering flag
       ! (no need to flip columns as with RRTMG)
-      top_at_1 = p_lay(1, 1) < p_lay(1, LM)
-      _ASSERT(top_at_1, 'unexpected vertical ordering')
+      ! A PET with no sunlit columns (ncol==0) has an empty p_lay. That can
+      ! happen once LoadBalance is forced off for the SW bridge (the balancer
+      ! used to hand every PET work); skip the ordering check there -- top_at_1
+      ! is then unused (no columns to solve or marshal).
+      if (ncol > 0) then
+         top_at_1 = p_lay(1, 1) < p_lay(1, LM)
+         _ASSERT(top_at_1, 'unexpected vertical ordering')
+      else
+         top_at_1 = .true.
+      end if
 
       ! layer pressure thicknesses used for cloud water path calculations
       ! (do before any KLUGE to top pressure so optical paths wont be affected)
@@ -5505,7 +5513,7 @@ contains
       ! are transmittances (independent of the absolute insolation), so native and
       ! bridge should match if the bridge SW + its normalization are right.
       ! net = down - up; top_at_1 => (:,1)=TOA, (:,LM+1)=surface. ---
-      if (MAPL_AM_I_Root()) then
+      if (MAPL_AM_I_Root() .and. ncol > 0) then
          write(*,'(a,3(x,es18.11))') '[GT4PY SWCHK] mean netTOA netSfc upTOA =', &
               sum(flux_net_allsky(:,1))   /size(flux_net_allsky,1), &
               sum(flux_net_allsky(:,LM+1))/size(flux_net_allsky,1), &
