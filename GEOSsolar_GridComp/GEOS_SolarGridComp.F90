@@ -3691,6 +3691,10 @@ contains
       ! fluxes that we actually need
       ! NB: fluxes_byand makes available fluxes%[bnd_]flux_[up|dn|net|dn_dir->"dir"].
       real(wp), dimension(:),       allocatable         :: flux_dn_top
+      ! Bridge SW normalization base = the bridge's OWN TOA incoming flux
+      ! (gt4py_fswd at k=1, sunlit columns). The bridge computes SW with its
+      ! own coszmn mu0, so normalize by its own incoming (not the model SLR1D).
+      real(wp), dimension(:),       allocatable         :: sw_norm_base
       real(wp), dimension(:,:),     allocatable, target :: flux_up_clrsky, flux_net_clrsky
       real(wp), dimension(:,:),     allocatable, target :: flux_up_allsky, flux_net_allsky
       real(wp), dimension(:,:,:),   allocatable, target :: bnd_flux_dn_allsky, bnd_flux_net_allsky, &
@@ -5379,6 +5383,13 @@ contains
                                 - flux_up_clrsky(:,kk)
         end do
 
+        ! SW normalization base = the bridge's OWN TOA incoming (gt4py_fswd at
+        ! k=1, sunlit columns). POST divides by this so the bridge's own coszmn
+        ! geometry cancels -> pure transmittance; the SLR heartbeat reapplies the
+        ! model insolation. Night columns were solver-zeroed so base ~0, flux 0.
+        allocate(sw_norm_base(ncol), __STAT__)
+        sw_norm_base(:) = real(pack(gt4py_fswd(:,1), reshape(daytime,(/ncfg/))), kind=wp)
+
         ! The bridge produces BROADBAND SW only; zero the per-band arrays (NumLit)
         ! so POST + the band-split surface fluxes (UV/PAR/NIR) get defined zeros
         ! (per-band SW from the bridge is a later task).
@@ -5465,14 +5476,24 @@ contains
 
       ! normalize by incoming solar radiation
       allocate(flux_dn_top(ncol), __STAT__)
-      ! Normalize by the MODEL's TOA insolation (SLR1D) -- native and bridge
-      ! alike. SLR1D is strictly positive for every lit column, so this cannot
-      ! blow up. Normalizing the bridge by its OWN TOA incoming floored at 1e-7
-      ! exploded terminator columns (bridge mu0 ~ 0 while the model still counts
-      ! the column as lit): flux/1e-7 dominated the mean. Store transmittance =
-      ! flux / SLR1D; the heartbeat rescale by live SLR reapplies the current
-      ! insolation (the same scheme the native path uses).
-      flux_dn_top(:) = real(max(SLR1D, 1e-7), kind=wp)
+      ! Normalize by TOA incoming to store transmittances. NATIVE divides by
+      ! the model insolation SLR1D. The BRIDGE divides by its OWN TOA incoming
+      ! (sw_norm_base): the bridge computes SW with its own coszmn mu0, so its
+      ! fluxes scale with the bridge's incoming, not SLR1D (whose mu0 differs
+      ! ~3x) -- dividing by the bridge's own incoming cancels the geometry and
+      ! gives pure transmittance with no terminator blow-up (night columns are
+      ! solver-zeroed, so flux 0 / floor = 0). The SLR heartbeat reapplies the
+      ! model insolation either way.
+#ifdef RUN_RRTMGP_GT4PY
+      if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 3) then
+         flux_dn_top(:) = max(sw_norm_base(:), real(1e-7, kind=wp))
+         deallocate(sw_norm_base, __STAT__)
+      else
+#endif
+         flux_dn_top(:) = real(max(SLR1D, 1e-7), kind=wp)
+#ifdef RUN_RRTMGP_GT4PY
+      end if
+#endif
       do k = 1, LM+1
         flux_up_clrsky (:,k) = flux_up_clrsky (:,k) / flux_dn_top(:)
         flux_net_clrsky(:,k) = flux_net_clrsky(:,k) / flux_dn_top(:)
