@@ -5507,21 +5507,27 @@ contains
       end do
       deallocate(flux_dn_top, __STAT__)
 
-      ! --- TEMP GT4PY SWCHK (remove after): normalized SW flux summary on the
-      ! root PET, for a native(mode 0) vs bridge(mode 3) numeric comparison at the
-      ! first radiation step (identical input state). Post-normalization => these
-      ! are transmittances (independent of the absolute insolation), so native and
-      ! bridge should match if the bridge SW + its normalization are right.
-      ! net = down - up; top_at_1 => (:,1)=TOA, (:,LM+1)=surface. ---
-      if (MAPL_AM_I_Root() .and. ncol > 0) then
-         write(*,'(a,3(x,es18.11))') '[GT4PY SWCHK] mean netTOA netSfc upTOA =', &
-              sum(flux_net_allsky(:,1))   /size(flux_net_allsky,1), &
-              sum(flux_net_allsky(:,LM+1))/size(flux_net_allsky,1), &
-              sum(flux_up_allsky (:,1))   /size(flux_up_allsky,1)
-         write(*,'(a,4(x,es18.11))') '[GT4PY SWCHK] net(min,max) up(min,max) =', &
-              minval(flux_net_allsky), maxval(flux_net_allsky), &
-              minval(flux_up_allsky), maxval(flux_up_allsky)
-      end if
+      ! --- TEMP GT4PY SWCHK (remove after): GLOBAL-mean normalized SW flux
+      ! summary for a native(mode 0) vs bridge(mode 3) numeric comparison at the
+      ! first radiation step. Post-normalization => transmittances (independent
+      ! of the absolute insolation), so the two legs should match if the bridge
+      ! SW + its normalization are right. Reduced over the whole communicator so
+      ! the mean is comparable regardless of which PET is lit -- load balancing
+      ! differs between the legs (off for the bridge, on for native), but the
+      ! global lit-column set is the same. net = down - up; top_at_1 => (:,1)=TOA,
+      ! (:,LM+1)=surface. Collective: every PET contributes (night PETs add 0). ---
+      block
+        real(wp) :: swchk_loc(4), swchk_glb(4)
+        swchk_loc(1) = sum(flux_net_allsky(:,1))       ! net TOA   (lit cols)
+        swchk_loc(2) = sum(flux_net_allsky(:,LM+1))    ! net surface
+        swchk_loc(3) = sum(flux_up_allsky (:,1))       ! up  TOA
+        swchk_loc(4) = real(ncol, kind=wp)             ! lit-column count
+        call ESMF_VMAllReduce(VM, swchk_loc, swchk_glb, 4, ESMF_REDUCE_SUM, __RC__)
+        if (MAPL_AM_I_Root() .and. swchk_glb(4) > 0._wp) then
+           write(*,'(a,3(x,es18.11))') '[GT4PY SWCHK] global mean netTOA netSfc upTOA =', &
+                swchk_glb(1)/swchk_glb(4), swchk_glb(2)/swchk_glb(4), swchk_glb(3)/swchk_glb(4)
+        end if
+      end block
 
       ! load output arrays
       ! clear-sky fluxes
