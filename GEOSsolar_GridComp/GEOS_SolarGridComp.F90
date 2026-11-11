@@ -5332,6 +5332,13 @@ contains
         fg_plev = real(reshape(fg_ple, (/ncfg,LM+1/)), kind=wp)
         fg_play = 0.5_wp*(fg_plev(:,1:LM) + fg_plev(:,2:LM+1))
         fg_tlay = real(reshape(fg_t,   (/ncfg,LM/)),   kind=wp)
+        ! Temperature KLUGE (mirror the native path): clamp layer temperature
+        ! into the RRTMGP k-dist table range [160,355] K. Without it a column
+        ! outside the range makes pyRTE's interpolate raise "Layer temperatures
+        ! outside valid range"; the CFFI bridge swallows that, step_radiation
+        ! dies for the block, and the Fortran reads uninitialized SW -> garbage.
+        fg_tlay = max(real(160.01_wp, kind=wp), &
+                      min(real(354.99_wp, kind=wp), fg_tlay))
 
         allocate(gt4py_q(ncfg,LM), gt4py_o3(ncfg,LM), gt4py_co2(ncfg,LM), __STAT__)
         allocate(gt4py_ql(ncfg,LM), gt4py_qi(ncfg,LM), gt4py_qcld(ncfg,LM), __STAT__)
