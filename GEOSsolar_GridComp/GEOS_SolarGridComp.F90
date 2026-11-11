@@ -5486,7 +5486,18 @@ contains
       ! model insolation either way.
 #ifdef RUN_RRTMGP_GT4PY
       if (run_rrtmgp_gt4py == 1 .or. run_rrtmgp_gt4py == 3) then
-         flux_dn_top(:) = max(sw_norm_base(:), real(1e-7, kind=wp))
+         ! Lit columns divide by their own TOA incoming. DARK columns (bridge
+         ! incoming ~ 0 -- night, or a terminator column the model counts as
+         ! lit) must NOT divide by a tiny floor (that blew netSfc up to ~1e7);
+         ! give them a huge divisor so their normalized flux is 0 (no sunlight
+         ! => no shortwave). The 1e-2 W/m2 cut sits far below any real lit
+         ! column (>=~0.14 W/m2 at the mu0<=1e-4 night-zero edge) and far above
+         ! the collapsed values, so it only catches the dark ones.
+         where (sw_norm_base(:) >= real(1e-2, kind=wp))
+            flux_dn_top(:) = sw_norm_base(:)
+         elsewhere
+            flux_dn_top(:) = real(1e30, kind=wp)
+         end where
          deallocate(sw_norm_base, __STAT__)
       else
 #endif
